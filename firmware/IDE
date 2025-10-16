@@ -1,0 +1,293 @@
+#include <DHT.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <esp_sleep.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// Configurações WiFi
+Preferences preferences;
+WebServer server(80);
+const char* apSSID = "ESP32_Config";
+const char* apPassword = "12345678";
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600, 60000);
+
+// Configurações ThingsBoard
+const char* thingsboardServer = "tb.geati.camboriu.ifc.edu.br";
+const char* accessToken = "f5a3iEEZ2iPhdIoVewTk";
+
+// Sensores
+#define DHTPIN 25
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// AS5600
+#define AS5600_ADDRESS 0x36
+#define AS5600_ANGLE_REG 0x0E
+
+// Anemômetro e Pluviômetro
+#define ANEMPIN 32
+#define PLUVIPIN 23
+volatile uint32_t anemCounter = 0;
+volatile uint32_t pluviCounter = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Temporização
+const float mmPerPulse = 1.729; // Valor original
+const float anemometerRadius = 87; // mm
+
+// Variáveis globais
+uint32_t sleepDuration = 60 * 1000000; // 60 segundos
+const int MAX_RECONNECT_ATTEMPTS = 10; // Numero de Tentativas que o ESP vai fazer antes de reiniciar.
+const unsigned long WIFI_RETRY_DELAY = 10000; // Delay entre cada tentativa.
+
+void IRAM_ATTR anemISR() {
+  static uint32_t lastTime = 0;
+  uint32_t now = millis();
+  
+  if (now - lastTime > 20) { // Debounce de 20ms
+    lastTime = now;
+    portENTER_CRITICAL_ISR(&mux);
+    anemCounter++;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+void IRAM_ATTR pluviISR() {
+  static uint32_t lastTime = 0;
+  uint32_t now = millis();
+  
+  if (now - lastTime > 100) { // Debounce de 100ms
+    lastTime = now;
+    portENTER_CRITICAL_ISR(&mux);
+    pluviCounter++;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  btStop();
+
+  // Inicialização dos sensores
+  pinMode(ANEMPIN, INPUT_PULLUP);
+  pinMode(PLUVIPIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ANEMPIN), anemISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PLUVIPIN), pluviISR, FALLING);
+  
+  dht.begin();
+
+  Wire.begin();
+  Wire.setClock(50000);
+
+  preferences.begin("wifi-config", false);
+
+  // Reinicia o contador se estiver em modo AP
+  if(preferences.getInt("reconnectAttempts", 0) >= MAX_RECONNECT_ATTEMPTS) {
+    preferences.putInt("reconnectAttempts", 0);
+  }
+
+  // Conexão WiFi
+  connectWiFi();
+}
+
+void loop() {
+  static uint32_t lastMeasurement = 0;
+  uint32_t now = millis();
+
+  if (now - lastMeasurement >= 60000 || lastMeasurement == 0) {
+    lastMeasurement = now;
+    
+    // Leitura DHT11 com verificação
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    float hic = dht.computeHeatIndex(t, h, false);
+    
+    if (isnan(h) || isnan(t)) {
+      Serial.println("Falha na leitura do DHT!");
+      h = t = hic = NAN;
+    }
+
+    // Direção do vento com delays aumentados
+    uint16_t angle = 0;
+    Wire.beginTransmission(AS5600_ADDRESS);
+    Wire.write(AS5600_ANGLE_REG);
+    if (Wire.endTransmission() == 0) {
+      delay(5);
+      Wire.requestFrom(AS5600_ADDRESS, 2);
+      delay(5);
+      angle = (Wire.read() << 8) | Wire.read();
+    }
+    String direction = getWindDirection((angle * 360.0) / 4096.0);
+
+    // Cálculos originais
+    float RPM = 0;
+    float windSpeed = 0;
+    float rainAmount = 0;
+    
+    portENTER_CRITICAL(&mux);
+    RPM = ((anemCounter * 60.0) / 5.0); // Período de 5 segundos
+    windSpeed = (((2 * PI * anemometerRadius * RPM) / 60) / 1000)* 3.6;
+    rainAmount = pluviCounter * mmPerPulse;
+    anemCounter = pluviCounter = 0;
+    portEXIT_CRITICAL(&mux);
+
+    // Obtém timestamp atual
+    String timestamp;
+    getTimestamp(timestamp);
+
+    // Exibe dados
+    Serial.print("Temp: "); Serial.print(t);
+    Serial.print("C | Hum: "); Serial.print(h);
+    Serial.print("% | Vento: "); Serial.print(windSpeed);
+    Serial.print("km/h | Chuva: "); Serial.print(rainAmount);
+    Serial.print("mm | Direção: "); Serial.println(direction);
+
+    // Envio para ThingsBoard
+    if (WiFi.status() == WL_CONNECTED) {
+      sendToTB(t, h, hic, direction, windSpeed, rainAmount, angle ,timestamp);
+    }
+
+    // Gerenciamento de energia
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    enterDeepSleep();
+  }
+
+  server.handleClient();
+}
+
+bool sendToTB(float temp, float hum, float heat, String dir, float wind, float rain, float angle, String timestamp) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  
+  String payload = "{\"temperatura\":" + String(temp) 
+                 + ",\"humidade\":" + String(hum)
+                 + ",\"calor\":" + String(heat)
+                 + ",\"direcao\":\"" + dir + "\""
+                 + ",\"velocidade do vento\":" + String(wind)
+                 + ",\"milimetros de chuva\":" + String(rain)
+                 + ",\"angle\":\"" + String(angle) + "\""
+                 + ",\"timestamp\":\"" + timestamp + "\"}";
+
+  bool success = false;
+  if (http.begin(client, thingsboardServer, 443, "/api/v1/"+String(accessToken)+"/telemetry")) {
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(payload);
+    success = (code == 200);
+    http.end();
+  }
+  client.stop();
+  return success;
+}
+
+String getWindDirection(float angle) {
+  const char* directions[] = {
+    "Norte", "Nordeste-Norte", "Nordeste", "Leste-Nordeste",
+    "Leste", "Leste-Sudeste", "Sudeste", "Sul-Sudeste",
+    "Sul", "Sul-Sudoeste", "Sudoeste", "Oeste-Sudoeste",
+    "Oeste", "Oeste-Noroeste", "Noroeste", "Norte-Noroeste"
+  };
+  
+  int index = (int)((angle + 11.25)/22.5) % 16;
+  return directions[index];
+}
+
+void getTimestamp(String &timestamp) {
+  if (WiFi.status() == WL_CONNECTED) {
+    timeClient.update();
+    timestamp = timeClient.getFormattedTime();
+  } else {
+    timestamp = "00:00:00";
+  }
+}
+
+void connectWiFi() {
+  String ssid = preferences.getString("ssid", "");
+  String password = preferences.getString("password", "");
+  static int reconnectAttempts = preferences.getInt("reconnectAttempts", 0);
+
+  if (ssid.length() > 0) {
+    WiFi.begin(ssid.c_str(), password.c_str());
+    
+    uint8_t attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\nConectado! IP: %s\n", WiFi.localIP().toString().c_str());
+      timeClient.begin();
+      reconnectAttempts = 0;
+      preferences.putInt("reconnectAttempts", 0);
+      return;
+    }
+    else {
+      reconnectAttempts++;
+      preferences.putInt("reconnectAttempts", reconnectAttempts);
+      
+      if(reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        Serial.println("\nMáximo de tentativas alcançado. Reiniciando...");
+        delay(1000);
+        ESP.restart();
+      }
+    }
+  }
+
+  startAPMode();
+}
+
+void startAPMode() {
+  WiFi.softAP(apSSID, apPassword);
+  Serial.printf("Modo AP ativo. IP: %s\n", WiFi.softAPIP().toString().c_str());
+  
+  server.on("/", []() {
+    String html = "<html><body><h1>Configurar WiFi</h1>"
+                 "<form action='/save' method='post'>"
+                 "SSID: <input type='text' name='ssid'><br>"
+                 "Senha: <input type='password' name='password'><br>"
+                 "<input type='submit' value='Salvar'></form></body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/save", HTTP_POST, []() {
+    String ssid = server.arg("ssid");
+    String password = server.arg("password");
+    
+    if (ssid.length() > 0) {
+      preferences.putString("ssid", ssid);
+      preferences.putString("password", password);
+      server.send(200, "text/html", "<h1>Configurações salvas! Reiniciando...</h1>");
+      delay(1000);
+      ESP.restart();
+    } else {
+      server.send(400, "text/html", "<h1>SSID inválido</h1>");
+    }
+  });
+
+  server.begin();
+}
+
+//void enterDeepSleep() {
+//  Serial.println("Entrando em light sleep...");
+//
+//  esp_sleep_enable_timer_wakeup(sleepDuration);
+//  
+//  // Entra em light sleep
+//  esp_light_sleep_start();
+//}
+
+
+void enterDeepSleep() {
+  Serial.println("Entrando em deep sleep...");
+  esp_sleep_enable_timer_wakeup(sleepDuration);
+  esp_deep_sleep_start();
+}
